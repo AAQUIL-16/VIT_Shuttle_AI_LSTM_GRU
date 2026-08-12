@@ -1,119 +1,89 @@
 import os
-import pickle
+import joblib
 import numpy as np
-import tensorflow as tf
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
+from keras.models import load_model
 
 app = FastAPI(
-    title="VIT Smart Shuttle ETA API",
-    description="LSTM-GRU Deep Learning Inference Engine for Shuttle Arrival Time Prediction"
+    title="Adaptive Route-Segment Synchronized Shuttle ETA Prediction API",
+    description="LSTM-GRU Deep Learning Inference Engine for Dynamic Campus Shuttle ETA",
+    version="2.0"
 )
 
-# Enable CORS for Flutter mobile & web clients
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Load Model Artifacts
+MODEL_PATH = os.path.join("model", "lstm_gru_eta_model.keras")
+FEATURE_SCALER_PATH = os.path.join("model", "feature_scaler.pkl")
+TARGET_SCALER_PATH = os.path.join("model", "target_scaler.pkl")
 
-# Paths to model artifacts
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
-MODEL_PATH = os.path.join(MODEL_DIR, "lstm_gru_eta_model.keras")
-FEATURE_SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler.pkl")
-TARGET_SCALER_PATH = os.path.join(MODEL_DIR, "target_scaler.pkl")
+try:
+    model = load_model(MODEL_PATH)
+    feature_scaler = joblib.load(FEATURE_SCALER_PATH)
+    target_scaler = joblib.load(TARGET_SCALER_PATH)
+    print("✅ All AI model artifacts loaded successfully.")
+except Exception as e:
+    print(f"⚠️ Error loading model artifacts: {e}")
+    model, feature_scaler, target_scaler = None, None, None
 
-# Global variables for loaded artifacts
-model = None
-feature_scaler = None
-target_scaler = None
+# Define Input Schemas matching Patent Specification
+class ShuttleTelemetryPoint(BaseModel):
+    latitude: float = Field(..., example=12.9692)
+    longitude: float = Field(..., example=79.1559)
+    speed_kmph: float = Field(..., example=18.5)
+    distance_km: float = Field(..., example=1.2)
+    segment_id: float = Field(default=1.0, example=1.0) # Route segment identification
 
-@app.on_event("startup")
-def load_artifacts():
-    """Load model and scalers when the API starts up."""
-    global model, feature_scaler, target_scaler
-    try:
-        if os.path.exists(MODEL_PATH):
-            model = tf.keras.models.load_model(MODEL_PATH)
-            print("✅ LSTM-GRU Model loaded successfully.")
-        else:
-            print(f"⚠️ Model file missing at: {MODEL_PATH}")
-
-        if os.path.exists(FEATURE_SCALER_PATH):
-            with open(FEATURE_SCALER_PATH, "rb") as f:
-                feature_scaler = pickle.load(f)
-            print("✅ Feature scaler loaded.")
-
-        if os.path.exists(TARGET_SCALER_PATH):
-            with open(TARGET_SCALER_PATH, "rb") as f:
-                target_scaler = pickle.load(f)
-            print("✅ Target scaler loaded.")
-
-    except Exception as e:
-        print(f"❌ Critical Error loading artifacts: {str(e)}")
-
-# Request schema definitions
-class LocationPoint(BaseModel):
-    latitude: float
-    longitude: float
-    speed_kmph: float
-    distance_km: float
-
-class SequenceRequest(BaseModel):
-    sequence: List[LocationPoint] = Field(
-        ..., 
-        min_items=10, 
-        max_items=10, 
-        description="Array of 10 historical location snapshots"
-    )
+class SequenceInput(BaseModel):
+    sequence: List[ShuttleTelemetryPoint]
 
 @app.get("/")
-def read_root():
+def health_check():
     return {
-        "status": "online",
-        "service": "VIT Smart Shuttle LSTM-GRU Inference Server",
+        "status": "Online",
+        "system": "Adaptive Route-Segment Synchronized Dynamic Shuttle Dispatch",
         "model_loaded": model is not None
     }
 
 @app.post("/predict_eta")
-def predict_eta(data: SequenceRequest):
-    if model is None or feature_scaler is None or target_scaler is None:
+def predict_eta(data: SequenceInput):
+    if not model or not feature_scaler or not target_scaler:
+        raise HTTPException(status_code=500, detail="Model assets are not initialized on server.")
+    
+    # 1. Validate sequence length required for recurrent architecture
+    if len(data.sequence) != 10:
         raise HTTPException(
-            status_code=503, 
-            detail="Model artifacts are not fully loaded on the server."
+            status_code=400, 
+            detail=f"Recurrent input sequence must contain exactly 10 time steps, got {len(data.sequence)}."
         )
 
     try:
-        # Convert Pydantic points to 2D numpy array: (10, 4)
-        raw_sequence = [
-            [pt.latitude, pt.longitude, pt.speed_kmph, pt.distance_km] 
+        # 2. Convert incoming JSON telemetry stream to 2D numpy array [10, 5]
+        raw_seq = [
+            [pt.latitude, pt.longitude, pt.speed_kmph, pt.distance_km, pt.segment_id] 
             for pt in data.sequence
         ]
-        sequence_np = np.array(raw_sequence)
+        raw_seq_np = np.array(raw_seq)
 
-        # Scale features using pre-fitted MinMax Scaler
-        scaled_seq = feature_scaler.transform(sequence_np)
+        # 3. Scale input sequence features using saved fit transformation
+        scaled_seq = feature_scaler.transform(raw_seq_np)
 
-        # Reshape to 3D tensor expected by Keras: (batch_size=1, sequence_length=10, features=4)
-        input_tensor = np.expand_dims(scaled_seq, axis=0)
+        # 4. Reshape for LSTM-GRU network expecting shape [batch_size=1, timesteps=10, features=5]
+        input_3d = np.expand_dims(scaled_seq, axis=0)
 
-        # Run Deep Learning Inference
-        scaled_pred = model.predict(input_tensor, verbose=0)
+        # 5. Run inference
+        scaled_prediction = model.predict(input_3d)
 
-        # Inverse transform to get ETA in real-world minutes
-        actual_eta = target_scaler.inverse_transform(scaled_pred)[0][0]
-
-        # Prevent negative predictions and round to 2 decimal places
-        final_eta = round(max(0.1, float(actual_eta)), 2)
+        # 6. Inverse transform model output back to real-world minutes
+        unscaled_eta = target_scaler.inverse_transform(scaled_prediction)
+        predicted_minutes = float(np.ravel(unscaled_eta)[0])
 
         return {
             "status": "success",
-            "predicted_travel_time_min": final_eta
+            "predicted_travel_time_min": round(max(0.1, predicted_minutes), 2),
+            "unit": "minutes",
+            "sync_status": "Route-Segment Synchronized"
         }
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
