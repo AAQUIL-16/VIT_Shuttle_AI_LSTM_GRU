@@ -3,16 +3,16 @@ import joblib
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List
 from keras.models import load_model
 
 app = FastAPI(
-    title="Passenger-Centric Micro-Transit RL & ETA Engine",
-    description="Inference Engine for Dwell-Inferred Crowding, ETA, and Passenger RL Decision Making",
+    title="Micro-Transit Latent Occupancy & EPA Recommendation Engine",
+    description="LSTM-GRU ETA prediction paired with Hardware-Free Latent Occupancy and Prescriptive Arbitration",
     version="3.0"
 )
 
-# Load Model Artifacts
+# Load AI Model Artifacts
 MODEL_PATH = os.path.join("model", "lstm_gru_eta_model.keras")
 FEATURE_SCALER_PATH = os.path.join("model", "feature_scaler.pkl")
 TARGET_SCALER_PATH = os.path.join("model", "target_scaler.pkl")
@@ -21,129 +21,119 @@ try:
     model = load_model(MODEL_PATH)
     feature_scaler = joblib.load(FEATURE_SCALER_PATH)
     target_scaler = joblib.load(TARGET_SCALER_PATH)
-    print("✅ All AI model artifacts loaded successfully.")
+    print("✅ LSTM-GRU Model and Scalers loaded successfully.")
 except Exception as e:
-    print(f"⚠️ Warning loading model artifacts: {e}")
+    print(f"⚠️ Warning: Running in fallback mode ({e})")
     model, feature_scaler, target_scaler = None, None, None
 
+# Schema Definitions
+class TelemetryPoint(BaseModel):
+    latitude: float
+    longitude: float
+    speed_kmph: float
+    distance_km: float
+    segment_id: float = 1.0
+    dwell_time_sec: float = Field(default=0.0, description="Stop dwell time in seconds")
 
-class ShuttleTelemetryPoint(BaseModel):
-    latitude: float = Field(..., example=12.9692)
-    longitude: float = Field(..., example=79.1559)
-    speed_kmph: float = Field(..., example=18.5)
-    distance_km: float = Field(..., example=1.2)
-    segment_id: Optional[float] = Field(default=1.0, example=1.0)
+class EPARequest(BaseModel):
+    sequence: List[TelemetryPoint]
+    user_walking_distance_km: float = Field(..., example=0.6)
+    bus_capacity_limit: int = Field(default=40, example=40)
 
-
-class RLDecisionRequest(BaseModel):
-    sequence: List[ShuttleTelemetryPoint]
-    passenger_destination: Optional[str] = "Main Gate"
-    walking_distance_km: Optional[float] = 1.0
-
-
-def infer_latent_occupancy(sequence: List[ShuttleTelemetryPoint]) -> tuple:
+# =====================================================================
+# NOVEL PILLAR 1: HARDWARE-FREE LATENT OCCUPANCY INFERENCE
+# =====================================================================
+def infer_latent_occupancy(dwell_time_sec: float, speed_kmph: float, capacity: int):
     """
-    Infers latent vehicle occupancy belief from telemetry dwell duration 
-    and stop patterns without physical passenger sensors.
+    Estimates hidden crowding state and boarding probability from GPS dwell dynamics
+    without physical passenger counter hardware.
     """
-    speeds = [pt.speed_kmph for pt in sequence]
-    # Dwell points identified where speed is sub-walking (< 3 km/h)
-    dwell_steps = sum(1 for s in speeds if s < 3.0)
-    dwell_ratio = dwell_steps / len(speeds)
-
-    if dwell_ratio >= 0.6:
-        crowding_state = "High"
-        boarding_prob = 0.25
-        crowding_penalty = 8.0
-    elif dwell_ratio >= 0.3:
-        crowding_state = "Medium"
-        boarding_prob = 0.70
-        crowding_penalty = 3.0
+    if speed_kmph > 3.0:
+        # Shuttle in motion -> Dwell baseline zero
+        boarding_rate = 0.0
     else:
-        crowding_state = "Low"
-        boarding_prob = 0.95
-        crowding_penalty = 0.0
+        # Non-linear boarding queue estimate (approx 2.5s per passenger boarding/alighting)
+        boarding_rate = dwell_time_sec / 2.5 
 
-    return crowding_state, boarding_prob, crowding_penalty
+    estimated_occupancy = min(capacity, int(boarding_rate * 3)) # Scaled occupancy estimate
+    occupancy_ratio = estimated_occupancy / capacity
 
-
-def rl_passenger_policy(eta_minutes: float, boarding_prob: float, crowding_penalty: float, walking_dist_km: float) -> str:
-    """
-    Evaluates expected reward utilities across actions: a in {Board, Wait, Walk}
-    R(a) = - (Travel_Time + Expected_Delay + Crowding_Disutility)
-    """
-    # Action 1: Walk (assuming average 4.8 km/h campus walking pace)
-    t_walk = (walking_dist_km / 4.8) * 60.0
-    q_walk = -t_walk
-
-    # Action 2: Board Targeted Shuttle
-    # Expected wait/travel penalized by boarding failure risk
-    expected_wait = (1.0 - boarding_prob) * 12.0  # Assumes 12-min penalty if left behind
-    q_board = -(eta_minutes + expected_wait + crowding_penalty)
-
-    # Action 3: Wait for Next Alternative Shuttle
-    q_wait = -(eta_minutes + 7.0 + 1.0)  # Next dispatch headway estimate
-
-    # Select optimal policy action
-    utilities = {"Board": q_board, "Wait": q_wait, "Walk": q_walk}
-    best_action = max(utilities, key=utilities.get)
-    return best_action
-
-
-@app.get("/")
-def health_check():
+    # Boarding Failure Risk (P_fail): Sigmoid transformation of occupancy ratio
+    p_fail = 1.0 / (1.0 + np.exp(-10 * (occupancy_ratio - 0.75)))
+    
     return {
-        "status": "Online",
-        "system": "VIT Micro-Transit Latent Occupancy & RL Decision System",
-        "model_loaded": model is not None,
-        "endpoint": "/predict_eta"
+        "estimated_occupancy": estimated_occupancy,
+        "occupancy_ratio": round(float(occupancy_ratio), 2),
+        "boarding_failure_risk": round(float(p_fail), 2)
     }
 
+# =====================================================================
+# NOVEL PILLAR 2: EXPLAINABLE PRESCRIPTIVE ARBITRATION (EPA) ENGINE
+# =====================================================================
+def run_epa_arbitration(predicted_eta_min: float, p_fail: float, walk_dist_km: float):
+    """
+    Calculates multi-objective disutility scores to output [BOARD, WAIT, WALK].
+    """
+    walking_speed_kmh = 4.5
+    walk_time_min = (walk_dist_km / walking_speed_kmh) * 60.0
 
-@app.post("/predict_eta")
-def predict_eta_and_decision(data: RLDecisionRequest):
-    if len(data.sequence) != 10:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Recurrent input sequence must contain exactly 10 time steps, received {len(data.sequence)}."
-        )
+    # Disutility Weights
+    w_wait, w_travel, w_risk = 0.4, 0.3, 0.3
 
-    # 1. Infer Latent Crowding and Boarding Probability
-    crowding_state, boarding_prob, crowding_penalty = infer_latent_occupancy(data.sequence)
+    # Disutility Formulations
+    u_board = (w_wait * predicted_eta_min) + (w_risk * p_fail * 15.0)
+    u_wait  = (w_wait * (predicted_eta_min + 8.0)) + (w_risk * (p_fail * 0.5) * 15.0) # Assume next bus in +8 min
+    u_walk  = (w_travel * walk_time_min)
 
-    # 2. Extract 4 training features matching feature_scaler.pkl
-    raw_seq = [
-        [pt.latitude, pt.longitude, pt.speed_kmph, pt.distance_km]
-        for pt in data.sequence
-    ]
-    raw_seq_np = np.array(raw_seq)
-
-    # 3. Compute ETA with fallback if model is uninitialized
-    predicted_minutes = 5.0
-    if model is not None and feature_scaler is not None and target_scaler is not None:
-        try:
-            scaled_seq = feature_scaler.transform(raw_seq_np)
-            input_3d = np.expand_dims(scaled_seq, axis=0)
-            scaled_prediction = model.predict(input_3d, verbose=0)
-            unscaled_eta = target_scaler.inverse_transform(scaled_prediction)
-            predicted_minutes = float(np.ravel(unscaled_eta)[0])
-            predicted_minutes = max(0.5, round(predicted_minutes, 2))
-        except Exception as e:
-            print(f"Inference error: {e}")
-            predicted_minutes = max(0.5, round(raw_seq_np[-1][3] / 0.25, 2))
+    # Arbitration Decision Logic
+    if p_fail > 0.70 and walk_time_min <= (predicted_eta_min + 5.0):
+        decision = "WALK"
+        reason = f"High boarding failure risk ({int(p_fail*100)}%). Walking takes {round(walk_time_min, 1)} mins vs waiting."
+    elif p_fail > 0.85:
+        decision = "WAIT"
+        reason = f"Shuttle at capacity ({int(p_fail*100)}% risk). Wait for the next upcoming shuttle."
     else:
-        # Fallback estimation based on distance
-        predicted_minutes = max(0.5, round(raw_seq_np[-1][3] / 0.25, 2))
+        decision = "BOARD"
+        reason = f"Optimal choice. Low boarding risk with estimated arrival in {round(predicted_eta_min, 1)} mins."
 
-    # 4. Compute Reinforcement Learning Recommendation
-    walking_dist = data.walking_distance_km if data.walking_distance_km else 1.0
-    recommendation = rl_passenger_policy(predicted_minutes, boarding_prob, crowding_penalty, walking_dist)
+    return {
+        "recommendation": decision,
+        "explanation": reason,
+        "metrics": {
+            "disutility_board": round(float(u_board), 2),
+            "disutility_wait": round(float(u_wait), 2),
+            "disutility_walk": round(float(u_walk), 2),
+            "walk_time_min": round(float(walk_time_min), 1)
+        }
+    }
+
+@app.post("/predict_epa")
+def predict_epa(data: EPARequest):
+    if len(data.sequence) != 10:
+        raise HTTPException(status_code=400, detail="Sequence must contain exactly 10 points.")
+
+    # 1. Infer Occupancy from latest telemetry point
+    latest_pt = data.sequence[-1]
+    occ_info = infer_latent_occupancy(latest_pt.dwell_time_sec, latest_pt.speed_kmph, data.bus_capacity_limit)
+
+    # 2. Predict ETA using LSTM-GRU Model
+    if model and feature_scaler and target_scaler:
+        raw_seq = [[pt.latitude, pt.longitude, pt.speed_kmph, pt.distance_km, pt.segment_id] for pt in data.sequence]
+        scaled_seq = feature_scaler.transform(np.array(raw_seq))
+        input_3d = np.expand_dims(scaled_seq, axis=0)
+        scaled_pred = model.predict(input_3d, verbose=0)
+        eta_min = float(np.ravel(target_scaler.inverse_transform(scaled_pred))[0])
+        eta_min = max(0.1, eta_min)
+    else:
+        # Mathematical fallback if local model is offline
+        eta_min = (latest_pt.distance_km / max(latest_pt.speed_kmph, 10.0)) * 60.0
+
+    # 3. Execute Explainable Prescriptive Arbitration
+    epa_result = run_epa_arbitration(eta_min, occ_info["boarding_failure_risk"], data.user_walking_distance_km)
 
     return {
         "status": "success",
-        "predicted_travel_time_min": predicted_minutes,
-        "recommendation": recommendation,
-        "crowding_state": crowding_state,
-        "boarding_prob": boarding_prob,
-        "unit": "minutes"
+        "predicted_eta_min": round(eta_min, 2),
+        "latent_occupancy": occ_info,
+        "epa_prescriptive_decision": epa_result
     }
